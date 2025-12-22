@@ -1,214 +1,459 @@
-#include<stdlib.h>
-#include<stdio.h>
-#include<string.h>
-#include<unistd.h>
-#include<signal.h>
-#ifndef NO_X
-#include<X11/Xlib.h>
-#endif
-#ifdef __OpenBSD__
-#define SIGPLUS			SIGUSR1+1
-#define SIGMINUS		SIGUSR1-1
-#else
-#define SIGPLUS			SIGRTMIN
-#define SIGMINUS		SIGRTMIN
-#endif
-#define LENGTH(X)               (sizeof(X) / sizeof (X[0]))
-#define CMDLENGTH		50
-#define MIN( a, b ) ( ( a < b) ? a : b )
-#define STATUSLENGTH (LENGTH(blocks) * CMDLENGTH + 1)
+/*
+ * dwmblocks.c
+ *
+ * - Periodically runs configured shell commands ("blocks") and assembles their outputs
+ *   into a single status string.
+ * - Publishes the status either by setting the X root window name (X11) or printing to stdout.
+ * - Supports interval-based updates and per-block on-demand updates driven by realtime signals.
+ * - Supports "button" events delivered via SIGUSR1 with a sigqueue payload. Button events are
+ *   exposed to block commands using the BUTTON environment variable for that invocation.
+ *
+ * Implementation highlights:
+ * - Signal handlers perform only async-signal-safe writes to a self-pipe; the main loop polls
+ *   the pipe and performs the heavy work (popen, string ops, X calls).
+ * - Uses sigaction to register handlers and SA_SIGINFO for SIGUSR1 (to receive payload).
+ */
 
+#define _POSIX_C_SOURCE 200809L /* for sigaction, sigemptyset, pipe, poll, etc. */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <fcntl.h>     /* fcntl, O_NONBLOCK, FD_CLOEXEC */
+#include <poll.h>      /* poll(), struct pollfd */
+#include <errno.h>
+#include <stdint.h>
+
+#ifndef NO_X
+#include <X11/Xlib.h>
+#endif
+
+/* Portability mapping for realtime signal base */
+#ifdef __OpenBSD__
+#define SIGPLUS   SIGUSR1+1
+#define SIGMINUS  SIGUSR1-1
+#else
+#define SIGPLUS   SIGRTMIN
+#define SIGMINUS  SIGRTMIN
+#endif
+
+/* Helper macros */
+#define LENGTH(X)      (sizeof(X) / sizeof (X[0]))
+#define CMDLENGTH      50
+#define MIN(a,b)       ((a) < (b) ? (a) : (b))
+
+/* NOTE: STATUSLENGTH depends on LENGTH(blocks). blocks[] is defined in blocks.h */
+#define STATUSLENGTH   (LENGTH(blocks) * CMDLENGTH + 1)
+
+/* Block definition (from blocks.h) - kept here for clarity */
 typedef struct {
-	char* icon;
-	char* command;
-	unsigned int interval;
-	unsigned int signal;
+    char *icon;            /* prefix text for display */
+    char *command;         /* shell command to run */
+    unsigned int interval; /* seconds between automatic updates (0 = never) */
+    unsigned int signal;   /* numeric signal id (mapped to SIGMINUS + signal) */
 } Block;
+
+/* Forward declarations for functions */
 #ifndef __OpenBSD__
 void dummysighandler(int num);
 #endif
-void sighandler(int num);
-void getcmds(int time);
-void getsigcmds(unsigned int signal);
-void setupsignals();
-void sighandler(int signum);
-int getstatus(char *str, char *last);
-void statusloop();
-void termhandler();
-void pstdout();
+void sighandler(int signum);                            /* realtime signal handler (writes to pipe) */
+void buttonhandler(int sig, siginfo_t *si, void *ucontext); /* SIGUSR1 handler (writes to pipe) */
+void termhandler(int signum);                           /* SIGTERM/SIGINT handler (sets flag) */
+
+void getcmds(int time);         /* update interval-driven blocks */
+void getsigcmds(unsigned int signal); /* update signal-driven blocks */
+void setupsignals(void);        /* install handlers, create self-pipe */
+
+int getstatus(char *str, char *last); /* assemble status string and detect change */
+void statusloop(void);          /* main loop */
+void pstdout(void);             /* writer to stdout */
+
 #ifndef NO_X
-void setroot();
-static void (*writestatus) () = setroot;
-static int setupX();
+void setroot(void);
+static int setupX(void);
 static Display *dpy;
 static int screen;
 static Window root;
-#else
-static void (*writestatus) () = pstdout;
 #endif
 
-
+/* Include user config which defines blocks[], delim[], delimLen */
 #include "blocks.h"
 
+/* Per-block status buffers */
 static char statusbar[LENGTH(blocks)][CMDLENGTH] = {0};
+/* Double-buffered assembled status */
 static char statusstr[2][STATUSLENGTH];
-static int statusContinue = 1;
+
+/* Transient BUTTON char: if non-NUL, it will be exported to the invoked command as env var BUTTON */
+static char button[] = "\0";
+
+/* Self-pipe for safe signal handling.
+ * Handlers write events into sigpipe[1]; main loop reads sigpipe[0].
+ */
+static int sigpipe[2] = { -1, -1 };
+
+/* Control flags */
+static volatile sig_atomic_t statusContinue = 1;
 static int returnStatus = 0;
 
-//opens process *cmd and stores output in *output
+/* Writer pointer: either setroot (X) or pstdout (stdout) */
+#ifndef NO_X
+static void (*writestatus)(void) = setroot;
+#else
+static void (*writestatus)(void) = pstdout;
+#endif
+
+/* ------------------------ Implementation ------------------------ */
+
+/* getcmd:
+ * Run the block command and capture its output into 'output'.
+ * If block->signal is set, the first byte of the written buffer is that signal value,
+ * then the icon and scraped output follow (legacy compact encoding).
+ */
 void getcmd(const Block *block, char *output)
 {
-	//make sure status is same until output is ready
-	char tempstatus[CMDLENGTH] = {0};
-	strcpy(tempstatus, block->icon);
-	FILE *cmdf = popen(block->command, "r");
-	if (!cmdf)
-		return;
-	int i = strlen(block->icon);
-	fgets(tempstatus+i, CMDLENGTH-i-delimLen, cmdf);
-	i = strlen(tempstatus);
-	//if block and command output are both not empty
-	if (i != 0) {
-		//only chop off newline if one is present at the end
-		i = tempstatus[i-1] == '\n' ? i-1 : i;
-		if (delim[0] != '\0') {
-			strncpy(tempstatus+i, delim, delimLen);
-		}
-		else
-			tempstatus[i++] = '\0';
-	}
-	strcpy(output, tempstatus);
-	pclose(cmdf);
+    if (block->signal) {
+        output[0] = (char)block->signal;
+        output++;
+    }
+
+    /* Copy icon prefix */
+    strcpy(output, block->icon);
+
+    FILE *cmdf = NULL;
+
+    if (*button) {
+        /* Expose the pending BUTTON to the child command; then clear it */
+        setenv("BUTTON", button, 1);
+        cmdf = popen(block->command, "r");
+        *button = '\0';
+        unsetenv("BUTTON");
+    } else {
+        cmdf = popen(block->command, "r");
+    }
+
+    if (!cmdf)
+        return;
+
+    int i = strlen(block->icon);
+
+    if (CMDLENGTH - i - (int)delimLen > 0)
+        fgets(output + i, CMDLENGTH - i - delimLen, cmdf);
+    else
+        output[i] = '\0';
+
+    i = strlen(output);
+    if (i != 0) {
+        i = (output[i - 1] == '\n') ? i - 1 : i;
+        if (delim[0] != '\0') {
+            strncpy(output + i, delim, delimLen);
+        } else {
+            output[i] = '\0';
+            i++;
+        }
+    }
+
+    pclose(cmdf);
 }
 
+/* getcmds: update interval-driven blocks (time is a tick counter; -1 means force all) */
 void getcmds(int time)
 {
-	const Block* current;
-	for (unsigned int i = 0; i < LENGTH(blocks); i++) {
-		current = blocks + i;
-		if ((current->interval != 0 && time % current->interval == 0) || time == -1)
-			getcmd(current,statusbar[i]);
-	}
+    const Block *current;
+    for (unsigned int i = 0; i < LENGTH(blocks); i++) {
+        current = &blocks[i];
+        if ((current->interval != 0 && time % current->interval == 0) || time == -1)
+            getcmd(current, statusbar[i]);
+    }
 }
 
+/* getsigcmds: run blocks matching the given signal id */
 void getsigcmds(unsigned int signal)
 {
-	const Block *current;
-	for (unsigned int i = 0; i < LENGTH(blocks); i++) {
-		current = blocks + i;
-		if (current->signal == signal)
-			getcmd(current,statusbar[i]);
-	}
+    const Block *current;
+    for (unsigned int i = 0; i < LENGTH(blocks); i++) {
+        current = &blocks[i];
+        if (current->signal == signal)
+            getcmd(current, statusbar[i]);
+    }
 }
 
-void setupsignals()
+/* setupsignals:
+ * - Create the self-pipe (read end non-blocking).
+ * - Register sighandler for each block's RT signal (SIGMINUS + blocks[i].signal).
+ * - Register buttonhandler for SIGUSR1 with SA_SIGINFO so we can receive sigqueue payloads.
+ * - Register termhandler for SIGTERM and SIGINT.
+ *
+ * Signal handlers only write small event bytes into the pipe.
+ */
+void setupsignals(void)
 {
 #ifndef __OpenBSD__
-	    /* initialize all real time signals with dummy handler */
-    for (int i = SIGRTMIN; i <= SIGRTMAX; i++)
-        signal(i, dummysighandler);
+    /* Register dummy handler for all RT signals to avoid default behavior */
+    for (int s = SIGRTMIN; s <= SIGRTMAX; s++) {
+        struct sigaction sa_dummy;
+        memset(&sa_dummy, 0, sizeof(sa_dummy));
+        sa_dummy.sa_handler = dummysighandler;
+        sigemptyset(&sa_dummy.sa_mask);
+        sa_dummy.sa_flags = 0;
+        sigaction(s, &sa_dummy, NULL);
+    }
 #endif
 
-	for (unsigned int i = 0; i < LENGTH(blocks); i++) {
-		if (blocks[i].signal > 0)
-			signal(SIGMINUS+blocks[i].signal, sighandler);
-	}
+    /* Create the self-pipe for event transport if not already created */
+    if (sigpipe[0] == -1) {
+        if (pipe(sigpipe) == -1) {
+            fprintf(stderr, "dwmblocks: pipe() failed: %s\n", strerror(errno));
+        } else {
+            /* set read end non-blocking so reads in main loop don't block */
+            int flags = fcntl(sigpipe[0], F_GETFL, 0);
+            if (flags != -1)
+                fcntl(sigpipe[0], F_SETFL, flags | O_NONBLOCK);
+            /* set close-on-exec to avoid leaking pipe fds to children */
+            flags = fcntl(sigpipe[0], F_GETFD, 0);
+            if (flags != -1)
+                fcntl(sigpipe[0], F_SETFD, flags | FD_CLOEXEC);
+            flags = fcntl(sigpipe[1], F_GETFD, 0);
+            if (flags != -1)
+                fcntl(sigpipe[1], F_SETFD, flags | FD_CLOEXEC);
+        }
+    }
 
+    /* Build mask for button handler to block RT signals while handling SIGUSR1 */
+    struct sigaction sa_button;
+    memset(&sa_button, 0, sizeof(sa_button));
+    sigemptyset(&sa_button.sa_mask);
+
+    /* Register RT signal handlers for blocks and add them to sa_button mask */
+    for (unsigned int i = 0; i < LENGTH(blocks); i++) {
+        if (blocks[i].signal > 0) {
+            struct sigaction sa_rt;
+            memset(&sa_rt, 0, sizeof(sa_rt));
+            sa_rt.sa_handler = sighandler;
+            sigemptyset(&sa_rt.sa_mask);
+            sa_rt.sa_flags = 0;
+            sigaction(SIGMINUS + blocks[i].signal, &sa_rt, NULL);
+
+            /* Block this RT signal while executing buttonhandler */
+            sigaddset(&sa_button.sa_mask, SIGMINUS + blocks[i].signal);
+        }
+    }
+
+    /* Install buttonhandler for SIGUSR1 (uses SA_SIGINFO to receive payload) */
+    sa_button.sa_sigaction = buttonhandler;
+    sa_button.sa_flags = SA_SIGINFO;
+    sigaction(SIGUSR1, &sa_button, NULL);
+
+    /* Install termhandler for SIGTERM and SIGINT using sigaction */
+    {
+        struct sigaction sa_term;
+        memset(&sa_term, 0, sizeof(sa_term));
+        sa_term.sa_handler = termhandler;
+        sigemptyset(&sa_term.sa_mask);
+        sa_term.sa_flags = 0;
+        sigaction(SIGTERM, &sa_term, NULL);
+        sigaction(SIGINT, &sa_term, NULL);
+    }
 }
 
+/* getstatus:
+ * Assemble all per-block strings into a single status string and remove trailing delim.
+ * Return non-zero if the assembled string differs from last (i.e., changed).
+ */
 int getstatus(char *str, char *last)
 {
-	strcpy(last, str);
-	str[0] = '\0';
-	for (unsigned int i = 0; i < LENGTH(blocks); i++)
-		strcat(str, statusbar[i]);
-	str[strlen(str)-strlen(delim)] = '\0';
-	return strcmp(str, last);//0 if they are the same
+    strcpy(last, str);
+    str[0] = '\0';
+
+    for (unsigned int i = 0; i < LENGTH(blocks); i++)
+        strcat(str, statusbar[i]);
+
+    size_t slen = strlen(str);
+    size_t dlen = strlen(delim);
+    if (slen >= dlen && dlen > 0)
+        str[slen - dlen] = '\0';
+    else
+        str[0] = '\0';
+
+    return strcmp(str, last);
 }
 
 #ifndef NO_X
-void setroot()
+/* setroot: publish status to X root window name */
+void setroot(void)
 {
-	if (!getstatus(statusstr[0], statusstr[1]))//Only set root if text has changed.
-		return;
-	XStoreName(dpy, root, statusstr[0]);
-	XFlush(dpy);
+    if (!getstatus(statusstr[0], statusstr[1]))
+        return;
+    XStoreName(dpy, root, statusstr[0]);
+    XFlush(dpy);
 }
 
-int setupX()
+/* setupX: open X display and set global root window */
+static int setupX(void)
 {
-	dpy = XOpenDisplay(NULL);
-	if (!dpy) {
-		fprintf(stderr, "dwmblocks: Failed to open display\n");
-		return 0;
-	}
-	screen = DefaultScreen(dpy);
-	root = RootWindow(dpy, screen);
-	return 1;
+    dpy = XOpenDisplay(NULL);
+    if (!dpy) {
+        fprintf(stderr, "dwmblocks: Failed to open display\n");
+        return 0;
+    }
+    screen = DefaultScreen(dpy);
+    root = RootWindow(dpy, screen);
+    return 1;
 }
 #endif
 
-void pstdout()
+/* pstdout: print status to stdout when it changes */
+void pstdout(void)
 {
-	if (!getstatus(statusstr[0], statusstr[1]))//Only write out if text has changed.
-		return;
-	printf("%s\n",statusstr[0]);
-	fflush(stdout);
+    if (!getstatus(statusstr[0], statusstr[1]))
+        return;
+    printf("%s\n", statusstr[0]);
+    fflush(stdout);
 }
 
-
-void statusloop()
+/* statusloop:
+ * - Call setupsignals()
+ * - Do an initial getcmds(-1) to populate blocks
+ * - Then every second: call getcmds(i++) for interval updates and poll the self-pipe
+ *   to process event messages coming from signal handlers.
+ *
+ * Event encoding in the pipe:
+ *  - 'R' <signal-id-byte>   : realtime signal event (update blocks with id)
+ *  - 'B' <button-byte> <sigid-byte> : button event (set BUTTON for next command, then update)
+ */
+void statusloop(void)
 {
-	setupsignals();
-	int i = 0;
-	getcmds(-1);
-	while (1) {
-		getcmds(i++);
-		writestatus();
-		if (!statusContinue)
-			break;
-		sleep(1.0);
-	}
+    setupsignals();
+
+    int i = 0;
+    getcmds(-1); /* initial fill */
+
+    struct pollfd pfd;
+    pfd.fd = (sigpipe[0] != -1) ? sigpipe[0] : -1;
+    pfd.events = POLLIN;
+
+    while (1) {
+        /* Interval-driven updates */
+        getcmds(i++);
+
+        if (pfd.fd != -1) {
+            int ret = poll(&pfd, 1, 1000); /* 1 second timeout */
+            if (ret > 0 && (pfd.revents & POLLIN)) {
+                unsigned char buf[256];
+                ssize_t n = read(pfd.fd, buf, sizeof(buf));
+                if (n > 0) {
+                    for (ssize_t off = 0; off < n; ) {
+                        unsigned char t = buf[off++];
+                        if (t == (unsigned char)'R') {
+                            if (off < n) {
+                                unsigned int sigid = (unsigned int)buf[off++];
+                                getsigcmds(sigid);
+                            } else {
+                                break;
+                            }
+                        } else if (t == (unsigned char)'B') {
+                            if (off + 1 < n) {
+                                unsigned char low = buf[off++];
+                                unsigned char high = buf[off++];
+                                *button = (char)('0' + (low & 0xff));
+                                getsigcmds((unsigned int)high);
+                            } else {
+                                break;
+                            }
+                        } else {
+                            /* Unknown token: stop parsing */
+                            break;
+                        }
+                    }
+                }
+            }
+        } else {
+            /* If pipe isn't available, fallback to sleeping */
+            sleep(1);
+        }
+
+        /* Publish the status (writers check for actual changes) */
+        writestatus();
+
+        if (!statusContinue)
+            break;
+    }
 }
 
+/* dummysighandler: no-op handler for initializing RT signals */
 #ifndef __OpenBSD__
-/* this signal handler should do nothing */
 void dummysighandler(int signum)
 {
-    return;
+    (void)signum;
 }
 #endif
 
+/* buttonhandler (SIGUSR1):
+ * - Receives siginfo_t payload (via sigqueue) with sival_int encoded as:
+ *     low byte: button id, high bytes: signal id
+ * - Writes an event into the self-pipe. This is async-signal-safe.
+ */
+void buttonhandler(int sig, siginfo_t *si, void *ucontext)
+{
+    (void)sig;
+    (void)ucontext;
+    if (sigpipe[1] != -1) {
+        unsigned char buf[3];
+        buf[0] = (unsigned char)'B';
+        buf[1] = (unsigned char)(si->si_value.sival_int & 0xff);
+        buf[2] = (unsigned char)((si->si_value.sival_int >> 8) & 0xff);
+        /* write is async-signal-safe; ignore return value */
+        (void)write(sigpipe[1], buf, sizeof(buf));
+    }
+}
+
+/* sighandler (realtime signals):
+ * - Encodes 'R' event and the signal id byte into the self-pipe.
+ */
 void sighandler(int signum)
 {
-	getsigcmds(signum-SIGPLUS);
-	writestatus();
+    if (sigpipe[1] != -1) {
+        unsigned char buf[2];
+        buf[0] = (unsigned char)'R';
+        buf[1] = (unsigned char)((signum - SIGPLUS) & 0xff);
+        (void)write(sigpipe[1], buf, sizeof(buf));
+    }
 }
 
-void termhandler()
+/* termhandler: set the volatile flag to request shutdown of main loop */
+void termhandler(int signum)
 {
-	statusContinue = 0;
+    (void)signum;
+    statusContinue = 0;
 }
 
-int main(int argc, char** argv)
+/* main: parse -d and -p options, init X (if compiled with X), set delimLen, and enter loop */
+int main(int argc, char **argv)
 {
-	for (int i = 0; i < argc; i++) {//Handle command line arguments
-		if (!strcmp("-d",argv[i]))
-			strncpy(delim, argv[++i], delimLen);
-		else if (!strcmp("-p",argv[i]))
-			writestatus = pstdout;
-	}
+    for (int i = 0; i < argc; i++) {
+        if (!strcmp("-d", argv[i])) {
+            strncpy(delim, argv[++i], delimLen);
+        } else if (!strcmp("-p", argv[i])) {
+            writestatus = pstdout;
+        }
+    }
+
 #ifndef NO_X
-	if (!setupX())
-		return 1;
+    if (!setupX())
+        return 1;
 #endif
-	delimLen = MIN(delimLen, strlen(delim));
-	delim[delimLen++] = '\0';
-	signal(SIGTERM, termhandler);
-	signal(SIGINT, termhandler);
-	statusloop();
+
+    delimLen = MIN(delimLen, strlen(delim));
+    delim[delimLen++] = '\0';
+
+    statusloop();
+
 #ifndef NO_X
-	XCloseDisplay(dpy);
+    XCloseDisplay(dpy);
 #endif
-	return 0;
+
+    return returnStatus;
 }
