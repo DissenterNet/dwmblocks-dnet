@@ -112,6 +112,7 @@ static void (*writestatus)(void) = pstdout;
  * @brief Execute a block command and capture its output into the provided buffer
  * @param block Pointer to Block structure containing command configuration
  * @param output Buffer to store the command output and any signal encoding
+ * @return void
  * 
  * This function executes a shell command using popen() and captures its output.
  * If the block has a signal configured, the first byte of the output buffer
@@ -128,7 +129,6 @@ static void (*writestatus)(void) = pstdout;
  * @bug ERROR HANDLING: No proper error checking for popen() failure
  * @bug RACE CONDITION: Button variable access is not thread-safe
  * 
- * @return void
  */
 void getcmd(const Block *block, char *output)
 {
