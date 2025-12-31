@@ -108,10 +108,27 @@ static void (*writestatus)(void) = pstdout;
 
 /* ------------------------ Implementation ------------------------ */
 
-/* getcmd:
- * Run the block command and capture its output into 'output'.
- * If block->signal is set, the first byte of the written buffer is that signal value,
- * then the icon and scraped output follow (legacy compact encoding).
+/**
+ * @brief Execute a block command and capture its output into the provided buffer
+ * @param block Pointer to Block structure containing command configuration
+ * @param output Buffer to store the command output and any signal encoding
+ * 
+ * This function executes a shell command using popen() and captures its output.
+ * If the block has a signal configured, the first byte of the output buffer
+ * is set to the signal value (legacy compact encoding), followed by the icon
+ * and command output.
+ * 
+ * Handles button events by setting BUTTON environment variable for the command
+ * if a button click is pending, then clears the button state.
+ * 
+ * @warning SECURITY: Command injection vulnerability through popen() - block commands
+ *          should be validated and come from trusted sources
+ * @warning PERFORMANCE: Uses popen() which spawns a shell process for each block
+ * @warning MEMORY: Potential buffer overflow if command output exceeds CMDLENGTH
+ * @bug ERROR HANDLING: No proper error checking for popen() failure
+ * @bug RACE CONDITION: Button variable access is not thread-safe
+ * 
+ * @return void
  */
 void getcmd(const Block *block, char *output)
 {
@@ -159,7 +176,21 @@ void getcmd(const Block *block, char *output)
     pclose(cmdf);
 }
 
-/* getcmds: update interval-driven blocks (time is a tick counter; -1 means force all) */
+/**
+ * @brief Update blocks that are configured for interval-based updates
+ * @param time Current tick counter value, -1 forces update of all blocks
+ * 
+ * This function iterates through all configured blocks and updates those
+ * that have interval-based timing configured. A block is updated when:
+ * - Its interval is non-zero AND current time modulo interval equals zero
+ * - OR when time is -1 (force update all blocks)
+ * 
+ * @note Time is typically incremented each second by the main loop
+ * @warning PERFORMANCE: Iterates through all blocks on every call
+ * @bug LOGIC: No validation of time parameter bounds
+ * 
+ * @return void
+ */
 void getcmds(int time)
 {
     const Block *current;
@@ -181,13 +212,27 @@ void getsigcmds(unsigned int signal)
     }
 }
 
-/* setupsignals:
- * - Create the self-pipe (read end non-blocking).
- * - Register sighandler for each block's RT signal (SIGMINUS + blocks[i].signal).
- * - Register buttonhandler for SIGUSR1 with SA_SIGINFO so we can receive sigqueue payloads.
- * - Register termhandler for SIGTERM and SIGINT.
- *
- * Signal handlers only write small event bytes into the pipe.
+/**
+ * @brief Initialize signal handling infrastructure for dwmblocks
+ * 
+ * This function sets up the complete signal handling system including:
+ * - Self-pipe creation for async-signal-safe communication
+ * - Real-time signal handlers for each block's configured signal
+ * - Button click handler with SA_SIGINFO for payload reception
+ * - Termination handlers for graceful shutdown
+ * 
+ * @warning COMPLEXITY: This function performs multiple critical operations
+ *          and any failure could leave system in inconsistent state
+ * @warning SECURITY: Signal handlers can be exploited for code execution
+ * @warning PERFORMANCE: Multiple sigaction() calls may impact startup time
+ * @bug ERROR HANDLING: Partial failure handling could leave signals unhandled
+ * @bug RESOURCE LEAK: If pipe() fails after some sigactions are set
+ * 
+ * @note Uses sigaction() instead of signal() for better control
+ * @note Self-pipe pattern avoids async-signal-safe restrictions
+ * @note SA_SIGINFO enables sigqueue payload reception
+ * 
+ * @return void
  */
 void setupsignals(void)
 {
@@ -314,15 +359,34 @@ void pstdout(void)
     fflush(stdout);
 }
 
-/* statusloop:
- * - Call setupsignals()
- * - Do an initial getcmds(-1) to populate blocks
- * - Then every second: call getcmds(i++) for interval updates and poll the self-pipe
- *   to process event messages coming from signal handlers.
- *
- * Event encoding in the pipe:
- *  - 'R' <signal-id-byte>   : realtime signal event (update blocks with id)
- *  - 'B' <button-byte> <sigid-byte> : button event (set BUTTON for next command, then update)
+/**
+ * @brief Main event loop for dwmblocks status bar system
+ * 
+ * This function implements the core event-driven architecture:
+ * 1. Initializes signal handling infrastructure
+ * 2. Performs initial block population
+ * 3. Enters infinite loop processing interval updates and signal events
+ * 
+ * Event encoding protocol:
+ * - 'R' <signal-id-byte> : Realtime signal event
+ * - 'B' <button-byte> <signal-id-byte> : Button click event
+ * 
+ * @warning CRITICAL: This function has multiple security vulnerabilities:
+ *          - Command injection through block commands
+ *          - Environment variable injection via BUTTON
+ *          - Unsafe signal handling with race conditions
+ * @warning PERFORMANCE: Inefficient string concatenation in getstatus()
+ * @warning MEMORY: Static buffers may be oversized, potential overflows
+ * @warning THREAD SAFETY: Global variables accessed without synchronization
+ * 
+ * @bug SECURITY: Block commands executed via popen() without validation
+ * @bug RACE CONDITION: Signal handlers and main loop share button variable
+ * @bug RESOURCE LEAK: File descriptors may not be closed on all error paths
+ * 
+ * @note Uses self-pipe pattern for async-signal-safe communication
+ * @note Implements double-buffering to avoid status flicker
+ * 
+ * @return void (exits via returnStatus global)
  */
 void statusloop(void)
 {
